@@ -330,7 +330,13 @@
     let releaseTime = 1.0;
     const activePrimes = new Set([3, 5, 7]); 
     let displayMode = 'hz'; 
-    let zoomLevel = 1.0; // Restored initial zoom
+    
+    // --- START OF ZOOM LOGIC CHANGE ---
+    const BASE_INTERNAL_ZOOM = 0.7; // The base internal zoom level (where UI shows 1.0x)
+    let uiZoomFactor = 1.0;         // The value displayed/controlled by the slider
+    let zoomLevel = BASE_INTERNAL_ZOOM; // The actual canvas zoom level
+    // --- END OF ZOOM LOGIC CHANGE ---
+
     let pan = { x: 0, y: 0 };
     let showHarmonics = true;
     let showSubharmonics = true;
@@ -760,13 +766,17 @@
 
     // --- PAN/ZOOM FUNCTIONS ---
 
-    function setZoom(newZoomLevel) {
-        const minZoom = parseFloat(document.getElementById('zoom-slider').min);
-        const maxZoom = parseFloat(document.getElementById('zoom-slider').max);
-        // Map the UI slider value (0.1 to 2.6) to zoomLevel (0.1 to 2.6)
-        zoomLevel = Math.min(maxZoom, Math.max(minZoom, newZoomLevel));
-        document.getElementById('zoom-slider').value = zoomLevel.toFixed(2);
-        document.getElementById('zoom-val').textContent = zoomLevel.toFixed(2);
+    function setZoom(newUiFactor) {
+        const minUiFactor = parseFloat(document.getElementById('zoom-slider').min);
+        const maxUiFactor = parseFloat(document.getElementById('zoom-slider').max);
+        
+        // Constrain the UI factor
+        uiZoomFactor = Math.min(maxUiFactor, Math.max(minUiFactor, newUiFactor));
+        // Calculate the actual zoom level: BASE_INTERNAL_ZOOM * UI Factor
+        zoomLevel = BASE_INTERNAL_ZOOM * uiZoomFactor; 
+
+        document.getElementById('zoom-slider').value = uiZoomFactor.toFixed(2);
+        document.getElementById('zoom-val').textContent = uiZoomFactor.toFixed(2); // Display the UI factor
         drawLattice();
     }
     
@@ -789,20 +799,19 @@
         
         // Check for pinch/trackpad zoom (ctrlKey is often true for trackpad pinch events)
         if (event.ctrlKey || event.metaKey) {
-            const oldZoomLevel = zoomLevel;
-            const zoomDelta = event.deltaY; 
-            const zoomFactor = -zoomDelta * 0.005 * zoomLevel; 
-            const newZoomLevel = oldZoomLevel + zoomFactor;
+            const oldZoomLevel = zoomLevel; // Capture current actual zoom level
+            const oldUiFactor = uiZoomFactor;
 
-            // Constrain new zoom level
-            setZoom(newZoomLevel);
-            
+            const zoomDelta = event.deltaY; 
+            const zoomChangeFactor = -zoomDelta * 0.005; // Base change, e.g., 0.02
+            const newUiFactor = oldUiFactor * (1 + zoomChangeFactor);
+
+            setZoom(newUiFactor); // Updates zoomLevel, uiZoomFactor, and UI
+
             // Calculate new pan required to keep the point under the cursor after zoom
-            // The point under the cursor *in world coordinates* must remain constant.
-            
-            // Adjust pan based on the cursor position and zoom change
-            pan.x -= cursorX * (1 - zoomLevel / oldZoomLevel);
-            pan.y -= cursorY * (1 - zoomLevel / oldZoomLevel);
+            const ratio = zoomLevel / oldZoomLevel;
+            pan.x -= cursorX * (1 - ratio);
+            pan.y -= cursorY * (1 - ratio);
 
         } else {
             // Two-finger pan (Scroll)
@@ -1011,7 +1020,7 @@
         });
 
         // Initialize display values for controls
-        document.getElementById('zoom-val').textContent = zoomLevel.toFixed(2);
+        document.getElementById('zoom-val').textContent = uiZoomFactor.toFixed(2); // Display 1.0
         document.getElementById('volume-val').textContent = masterGain.gain.value.toFixed(2);
         document.getElementById('attack-val').textContent = attackTime.toFixed(2);
         document.getElementById('decay-val').textContent = releaseTime.toFixed(2);
