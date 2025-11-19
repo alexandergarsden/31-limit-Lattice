@@ -330,7 +330,7 @@
     let releaseTime = 1.0;
     const activePrimes = new Set([3, 5, 7]); 
     let displayMode = 'hz'; 
-    let zoomLevel = 0.7;
+    let zoomLevel = 1.0; // Restored initial zoom
     let pan = { x: 0, y: 0 };
     let showHarmonics = true;
     let showSubharmonics = true;
@@ -338,6 +338,10 @@
     let hoveredNode = null;
     let hoveredOctave = { node: null, octaveIndex: -1 };
     let highlightedIntervals = [];
+
+    // State variables for panning interaction
+    let isDragging = false;
+    let lastMouseX, lastMouseY;
 
     /* 2. UTILITY FUNCTIONS */
     function gcd(a,b){ return b===0?a:gcd(b,a%b); }
@@ -471,15 +475,36 @@
     /* 4. NODE GENERATION */
     let nodes;
     let existingRatios;
+    let visibleNodesCache = []; // Cache for visible nodes
 
     function generateLatticeNodes(generationMode = 'all', nodesToPreserve = []) {
         const newNodes = []; const newRatios = new Map(); const ratioKey = r => r.join(',');
-        nodesToPreserve.forEach(node => { const key = ratioKey(node.ratio); if (!newRatios.has(key)) { newNodes.push(node); newRatios.set(key, node); }});
+        // Preserving active state from old nodes
+        const preservedStateMap = new Map();
+        nodesToPreserve.forEach(node => {
+            preservedStateMap.set(ratioKey(node.ratio), node.octaveStates);
+        });
+
         const createNode = (ratio, x, y) => {
-            const key = ratioKey(ratio); if (newRatios.has(key)) return newRatios.get(key);
-            const newNode = { ratio, x, y, primes: ratioPrimeFactors(ratio), non2Primes_withMultiplicity: getRatioPrimeFactorsWithMultiplicity(ratio), simplicityScore: ratio[0]*ratio[1], octaveStates: new Array(5).fill(null) };
-            newNodes.push(newNode); newRatios.set(key, newNode); return newNode;
+            const key = ratioKey(ratio); 
+            // Check if node already exists (e.g., preserving state from previous call)
+            if (newRatios.has(key)) {
+                return newRatios.get(key);
+            }
+
+            const newNode = { 
+                ratio, x, y, 
+                primes: ratioPrimeFactors(ratio), 
+                non2Primes_withMultiplicity: getRatioPrimeFactorsWithMultiplicity(ratio), 
+                simplicityScore: ratio[0]*ratio[1], 
+                // Restore state if available, otherwise initialize to inactive
+                octaveStates: preservedStateMap.get(key) || new Array(5).fill(null) 
+            };
+            newNodes.push(newNode); 
+            newRatios.set(key, newNode); 
+            return newNode;
         };
+
         const baseGridSnapshot = [];
         for (let c3=latticeRange.x[0]; c3<=latticeRange.x[1]; c3++) {
             for (let c5=latticeRange.y[0]; c5<=latticeRange.y[1]; c5++) {
@@ -522,31 +547,80 @@
             ctx.clearRect(0,0,r.width*dpr,r.height*dpr); ctx.save(); ctx.scale(dpr,dpr); 
             ctx.translate(r.width/2+pan.x, r.height/2+pan.y); ctx.scale(zoomLevel,zoomLevel); ctx.translate(-centerX,-centerY);
             const aP=[3,5,7,11,13,17,19,23,29,31]; const sMDS=spacing*1.2*spacing*1.2;
-            let vN = nodes.filter(shouldNodeBeVisible);
-            const pM = new Map();
-            for(const n of [...vN].reverse()){const pK=`${n.x.toFixed(3)},${n.y.toFixed(3)}`;if(!pM.has(pK)){pM.set(pK,n);}}
-            const nTR = Array.from(pM.values());
+            
+            // 1. Filter nodes to be visible
+            const vN = nodes.filter(shouldNodeBeVisible);
+            visibleNodesCache = vN; 
+
+            // 2. Aggregate nodes by visual coordinates for de-duplication and state checks
+            const nodesAtCoord = new Map(); // Key: "x,y", Value: Array of nodes (e.g., 1/1, 2/1, 4/1)
+            const pM = new Map(); // Key: "x,y", Value: The single node chosen for rendering (last one in vN wins)
+
+            for (const n of vN) {
+                const pK = `${n.x.toFixed(3)},${n.y.toFixed(3)}`;
+                if (!nodesAtCoord.has(pK)) {
+                    nodesAtCoord.set(pK, []);
+                }
+                nodesAtCoord.get(pK).push(n);
+                
+                // Keep track of the node that will be visually rendered (last one wins)
+                pM.set(pK, n);
+            }
+
+            const nTR = Array.from(pM.values()); // Nodes To Render (deduplicated list)
+            
+            // Draw lines
             for(let i=0;i<nTR.length;i++){
                 for(let j=i+1;j<nTR.length;j++){
                     const f=nTR[i],g=nTR[j]; if(Math.pow(f.x-g.x,2)+Math.pow(f.y-g.y,2)>sMDS)continue;
                     for(const fac of aP){if(isFactorRelated(f,g,fac)){let c=LINE_COLORS.light;if(fac<=5&&getMaxPrime(f)<7&&getMaxPrime(g)<7){c=LINE_COLORS.dark;}
                     ctx.beginPath();ctx.strokeStyle=c;ctx.lineWidth=1;ctx.moveTo(f.x,f.y);ctx.lineTo(g.x,g.y);ctx.stroke();break;}}}}
+            
+            // Draw nodes and octave selectors
             for(const n of nTR){
-                const iAP=n.octaveStates.some(o=>o!==null); const l=getHighestPrimeLimit(n); const cS=NODE_COLORS[l];
+                const pK = `${n.x.toFixed(3)},${n.y.toFixed(3)}`;
+                const nodesAtThisCoord = nodesAtCoord.get(pK) || [];
+
+                // Determine if ANY node at this visual location is active (Octave duplication fix)
+                let isAnyActive = false;
+                for (const dupeNode of nodesAtThisCoord) {
+                    if (dupeNode.octaveStates.some(o => o !== null)) {
+                        isAnyActive = true;
+                        break;
+                    }
+                }
+                
+                const iAP = isAnyActive;
+                const l=getHighestPrimeLimit(n); const cS=NODE_COLORS[l];
+                
+                let nodeFillColor = cS ? (iAP ? cS.a : cS.p) : '#ff00ff';
+                
                 ctx.beginPath();ctx.arc(n.x,n.y,NODE_RADIUS,0,2*Math.PI);
-                ctx.fillStyle=cS?(iAP?cS.a:cS.p):'#ff00ff'; ctx.fill();
+                ctx.fillStyle=nodeFillColor; ctx.fill();
                 ctx.strokeStyle=iAP?'#000':'#333'; ctx.lineWidth=iAP?2:1; ctx.stroke();
                 const fT=fractionLabel(n.ratio[0],n.ratio[1]); let fS=10; const aW=NODE_RADIUS*1.8;
                 ctx.font=`${fS}px "Helvetica Neue"`; let tW=ctx.measureText(fT).width;
                 while(tW>aW&&fS>4){fS--; ctx.font=`${fS}px "Helvetica Neue"`; tW=ctx.measureText(fT).width;}
                 ctx.fillStyle='white'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(fT,n.x,n.y);
                 
+                // Octave selectors (must check all nodes at this coordinate for the specific octave state)
+                
                 OCTAVE_MULTIPLIERS.forEach((multiplier, idx) => {
                     const y = n.y - (2 * OCTAVE_SELECTOR_Y_STEP) + (idx * OCTAVE_SELECTOR_Y_STEP);
                     const x = n.x + OCTAVE_SELECTOR_X_OFFSET;
                     ctx.beginPath();
                     ctx.arc(x, y, OCTAVE_SELECTOR_RADIUS, 0, 2 * Math.PI);
-                    ctx.fillStyle = n.octaveStates[idx] ? '#000' : '#b3b3b3';
+                    
+                    // Determine if ANY node at this coordinate has THIS SPECIFIC octave active
+                    let isThisOctaveActive = false;
+                    for (const dupeNode of nodesAtThisCoord) {
+                        if (dupeNode.octaveStates[idx] !== null) {
+                            isThisOctaveActive = true;
+                            break;
+                        }
+                    }
+
+                    ctx.fillStyle = isThisOctaveActive ? NODE_COLORS[l].a : '#b3b3b3'; 
                     ctx.strokeStyle = '#999';
                     ctx.lineWidth = 1;
                     ctx.fill();
@@ -652,18 +726,14 @@
         }
     }
     
-    function toggleOctave(nD, oI, isMainNodeClick = false) {
+    function toggleOctave(nD, oI) {
         if (!nD) return;
         const octaveIndex = oI;
 
+        // --- DEACTIVATION ---
         if (nD.octaveStates[octaveIndex] !== null) {
-            // --- DEACTIVATION ---
-            if (isMainNodeClick) {
-                deactivateAllOctaves(nD);
-            } else {
-                deactivateOctave(nD, octaveIndex);
-                drawLattice(); 
-            }
+            deactivateOctave(nD, octaveIndex);
+            drawLattice(); 
             return;
         }
         
@@ -687,136 +757,392 @@
     function deactivateAllOctaves(nD){if(!nD)return;let ch=false;nD.octaveStates.forEach((o,i)=>{if(o!==null){deactivateOctave(nD,i);ch=true;}});if(ch)drawLattice();}
     window.deactivateAll=function(){nodes.forEach(f=>deactivateAllOctaves(f));}
 
+
+    // --- PAN/ZOOM FUNCTIONS ---
+
+    function setZoom(newZoomLevel) {
+        const minZoom = parseFloat(document.getElementById('zoom-slider').min);
+        const maxZoom = parseFloat(document.getElementById('zoom-slider').max);
+        // Map the UI slider value (0.1 to 2.6) to zoomLevel (0.1 to 2.6)
+        zoomLevel = Math.min(maxZoom, Math.max(minZoom, newZoomLevel));
+        document.getElementById('zoom-slider').value = zoomLevel.toFixed(2);
+        document.getElementById('zoom-val').textContent = zoomLevel.toFixed(2);
+        drawLattice();
+    }
+    
+    function getMouseWorldPos(e) {
+        const r = canvas.getBoundingClientRect();
+        const mX = e.clientX - r.left;
+        const mY = e.clientY - r.top;
+        const wX = (mX - r.width / 2 - pan.x) / zoomLevel + centerX;
+        const wY = (mY - r.height / 2 - pan.y) / zoomLevel + centerY;
+        return { worldX: wX, worldY: wY, screenX: mX, screenY: mY };
+    }
+
+    function handleZoom(event) {
+        event.preventDefault(); // Prevent default scroll behavior
+        
+        const canvasRect = canvas.getBoundingClientRect();
+        // Cursor position relative to the canvas center (in screen coordinates)
+        const cursorX = event.clientX - canvasRect.left - canvasRect.width / 2;
+        const cursorY = event.clientY - canvasRect.top - canvasRect.height / 2;
+        
+        // Check for pinch/trackpad zoom (ctrlKey is often true for trackpad pinch events)
+        if (event.ctrlKey || event.metaKey) {
+            const oldZoomLevel = zoomLevel;
+            const zoomDelta = event.deltaY; 
+            const zoomFactor = -zoomDelta * 0.005 * zoomLevel; 
+            const newZoomLevel = oldZoomLevel + zoomFactor;
+
+            // Constrain new zoom level
+            setZoom(newZoomLevel);
+            
+            // Calculate new pan required to keep the point under the cursor after zoom
+            // The point under the cursor *in world coordinates* must remain constant.
+            
+            // Adjust pan based on the cursor position and zoom change
+            pan.x -= cursorX * (1 - zoomLevel / oldZoomLevel);
+            pan.y -= cursorY * (1 - zoomLevel / oldZoomLevel);
+
+        } else {
+            // Two-finger pan (Scroll)
+            pan.x -= event.deltaX * 0.6;
+            pan.y -= event.deltaY * 0.6;
+        }
+
+        drawLattice();
+    }
+    
+    function handlePanStart(event) {
+        if (event.button === 0) { // Left click for drag pan
+            isDragging = true;
+            lastMouseX = event.clientX;
+            lastMouseY = event.clientY;
+            canvas.style.cursor = 'grabbing';
+        }
+    }
+
+    function handlePanMove(event) {
+        if (!isDragging) return;
+
+        const dx = event.clientX - lastMouseX;
+        const dy = event.clientY - lastMouseY;
+
+        // Update pan
+        pan.x += dx; 
+        pan.y += dy;
+
+        lastMouseX = event.clientX;
+        lastMouseY = event.clientY;
+        drawLattice();
+    }
+
+    function handlePanEnd() {
+        isDragging = false;
+        canvas.style.cursor = 'default';
+    }
+    
+    function findNodeAt(x, y) {
+        const { worldX, worldY } = getMouseWorldPos({clientX: x, clientY: y});
+
+        // Only iterate over nodes that are currently visible (from the cache)
+        // Reverse iteration prioritizes nodes drawn last (on top, for octaves)
+        for (const n of [...visibleNodesCache].reverse()) {
+            
+            // Check octave selectors
+            for (let i = 0; i < OCTAVE_MULTIPLIERS.length; i++) {
+                const octaveX = n.x + OCTAVE_SELECTOR_X_OFFSET;
+                const octaveY = n.y - (2 * OCTAVE_SELECTOR_Y_STEP) + (i * OCTAVE_SELECTOR_Y_STEP);
+                const octDistSq = Math.pow(octaveX - worldX, 2) + Math.pow(octaveY - worldY, 2);
+                if (octDistSq < Math.pow(OCTAVE_SELECTOR_RADIUS * 3, 2)) { 
+                    return { node: n, type: 'octave', index: i };
+                }
+            }
+
+            // Check main node circle
+            const distSq = Math.pow(n.x - worldX, 2) + Math.pow(n.y - worldY, 2);
+            if (distSq < Math.pow(NODE_RADIUS, 2)) {
+                return { node: n, type: 'node', index: 2 }; // Index 2 is the 1:1 octave
+            }
+        }
+        return null;
+    }
+
+
     /* --- EVENT HANDLERS --- */
     function populateIntervalSelector() {
         const select = document.getElementById('interval-select');
-        select.innerHTML = '<option value="">Select a preset...</option>';
-        for (const groupName in PRESET_INTERVALS) {
+        select.innerHTML = '<option value="">Select a preset...</option>'; 
+        for (const group in PRESET_INTERVALS) {
             const optgroup = document.createElement('optgroup');
-            optgroup.label = groupName;
-            for (const intervalName in PRESET_INTERVALS[groupName]) {
+            optgroup.label = group;
+            for (const name in PRESET_INTERVALS[group]) {
                 const option = document.createElement('option');
-                option.textContent = intervalName;
-                option.value = PRESET_INTERVALS[groupName][intervalName];
+                option.textContent = name;
+                option.value = PRESET_INTERVALS[group][name];
                 optgroup.appendChild(option);
             }
             select.appendChild(optgroup);
         }
     }
-
-    function resizeCanvas(){const c=document.getElementById('container');const dpr=window.devicePixelRatio||1;const r=c.getBoundingClientRect();canvas.width=r.width*dpr;canvas.height=r.height*dpr;canvas.style.width=`${r.width}px`;canvas.style.height=`${r.height}px`;drawLattice();}
-    function getMouseWorldPos(e){const r=canvas.getBoundingClientRect();const mX=e.clientX-r.left;const mY=e.clientY-r.top;const wX=(mX-r.width/2-pan.x)/zoomLevel+centerX;const wY=(mY-r.height/2-pan.y)/zoomLevel+centerY;return{worldX:wX,worldY:wY};}
     
-    canvas.addEventListener('mousemove', (e) => {
-        const { worldX, worldY } = getMouseWorldPos(e);
-        let newHoveredNode = null;
-        let newHoveredOctave = { node: null, octaveIndex: -1 };
-        let isHovering = false;
+    function handleCanvasClick(event) {
+        if (isDragging) return; 
         
-        const visibleNodes = nodes.filter(shouldNodeBeVisible);
-
-        for (let i = visibleNodes.length - 1; i >= 0; i--) {
-            const n = visibleNodes[i];
-            
-            for (let j = 0; j < OCTAVE_MULTIPLIERS.length; j++) {
-                const sX = n.x + OCTAVE_SELECTOR_X_OFFSET;
-                const sY = n.y - (2 * OCTAVE_SELECTOR_Y_STEP) + (j * OCTAVE_SELECTOR_Y_STEP);
-                if (Math.pow(worldX - sX, 2) + Math.pow(worldY - sY, 2) < (OCTAVE_SELECTOR_RADIUS + 4) * (OCTAVE_SELECTOR_RADIUS + 4)) {
-                    newHoveredOctave = { node: n, octaveIndex: j };
-                    isHovering = true;
-                    break;
+        const hit = findNodeAt(event.clientX, event.clientY);
+        if (hit) {
+            if (hit.type === 'node') {
+                const n = hit.node;
+                const anyActive = n.octaveStates.some(o => o !== null);
+                if (anyActive) {
+                    // If any octave is active, deactivate all octaves
+                    deactivateAllOctaves(n);
+                } else {
+                    // If nothing is active, trigger the central pitch (index 2: 1:1 multiplier)
+                    toggleOctave(n, 2); 
                 }
-            }
-            if (isHovering) break;
-
-            if (Math.pow(worldX - n.x, 2) + Math.pow(worldY - n.y, 2) < NODE_RADIUS * NODE_RADIUS) {
-                newHoveredNode = n;
-                isHovering = true;
-                break;
+            } else if (hit.type === 'octave') {
+                toggleOctave(hit.node, hit.index); 
             }
         }
+    }
 
-        canvas.style.cursor = isHovering ? 'pointer' : 'default';
-
-        if (hoveredNode !== newHoveredNode || hoveredOctave.node !== newHoveredOctave.node || hoveredOctave.octaveIndex !== newHoveredOctave.octaveIndex) {
-            hoveredNode = newHoveredNode;
-            hoveredOctave = newHoveredOctave;
-            drawLattice();
-        }
-    });
-
-    canvas.addEventListener('click',(e)=>{const{worldX,worldY}=getMouseWorldPos(e);const vN=nodes.filter(shouldNodeBeVisible);const nTC=[...vN].reverse();
-    for(const n of nTC){if(Math.pow(worldX-n.x,2)+Math.pow(worldY-n.y,2)<NODE_RADIUS*NODE_RADIUS){toggleOctave(n,2,true);return;}
-    for(let j=0;j<OCTAVE_MULTIPLIERS.length;j++){const sX=n.x+OCTAVE_SELECTOR_X_OFFSET;const sY=n.y-(2*OCTAVE_SELECTOR_Y_STEP)+(j*OCTAVE_SELECTOR_Y_STEP);if(Math.pow(worldX-sX,2)+Math.pow(worldY-sY,2)<(OCTAVE_SELECTOR_RADIUS+4)*(OCTAVE_SELECTOR_RADIUS+4)){toggleOctave(n,j,false);return;}}}});
-    canvas.addEventListener('wheel',(e)=>{e.preventDefault();pan.x-=e.deltaX;pan.y-=e.deltaY;drawLattice();});
-    
-    document.getElementById('zoom-slider').addEventListener('input',(e)=>{const dZ=parseFloat(e.target.value);zoomLevel=0.5*dZ+0.2;document.getElementById('zoom-val').textContent=dZ.toFixed(2);drawLattice();});
-    document.getElementById('waveform').addEventListener('change',(e)=>{waveform=e.target.value;});
-    document.getElementById('attack').addEventListener('input',(e)=>{attackTime=parseFloat(e.target.value);document.getElementById('attack-val').textContent=attackTime.toFixed(2);});
-    document.getElementById('decay').addEventListener('input',(e)=>{releaseTime=parseFloat(e.target.value);document.getElementById('decay-val').textContent=releaseTime.toFixed(2);});
-    document.getElementById('volume').addEventListener('input',(e)=>{const v=parseFloat(e.target.value);masterGain.gain.setValueAtTime(v,audioCtx.currentTime);document.getElementById('volume-val').textContent=v.toFixed(2);});
-    document.getElementById('filter-freq').addEventListener('input',(e)=>{const v=parseFloat(e.target.value);lowPassFilter.frequency.setValueAtTime(v,audioCtx.currentTime);document.getElementById('filter-freq-val').textContent=v.toFixed(0);});
-    document.getElementById('filter-q').addEventListener('input',(e)=>{const v=parseFloat(e.target.value);lowPassFilter.Q.setValueAtTime(v,audioCtx.currentTime);document.getElementById('filter-q-val').textContent=v.toFixed(1);});
-    window.setFundamental=function(){const i=document.getElementById('fundamental-input').value.trim();let nF=0;if(displayMode==='hz')nF=parseFloat(i);else nF=pitchNameToFreq(i);
-    if(nF>0){fundamental=nF;if(displayMode==='pitch')document.getElementById('fundamental-input').value=freqToPitchName(fundamental);else document.getElementById('fundamental-input').value=fundamental.toFixed(2);deactivateAll();drawLattice();}
-    else{alert(`Invalid format for ${displayMode==='hz'?'Frequency (Hz)':'Pitch Name (+ Cents)'}. Example: 440 or A4 +0c.`);if(displayMode==='hz')document.getElementById('fundamental-input').value=fundamental.toFixed(2);else document.getElementById('fundamental-input').value=freqToPitchName(fundamental);}};
-    document.querySelectorAll('input[name="pitch-display"]').forEach(r=>{r.addEventListener('change',(e)=>{displayMode=e.target.value;const iE=document.getElementById('fundamental-input');const lE=document.getElementById('fundamental-label');
-    if(displayMode==='hz'){lE.textContent='Fundamental (Hz):';iE.value=fundamental.toFixed(2);}else{lE.textContent='Fundamental (Pitch + Cents):';iE.value=freqToPitchName(fundamental);}drawLattice();});});
-    
-    const pLS=document.getElementById('prime-limit-select');const pCB=document.querySelectorAll('#prime-filters input[type="checkbox"]');
-    const pL={'3':[3],'5':[3,5],'7':[3,5,7],'11':[3,5,7,11],'13':[3,5,7,11,13],'17':[3,5,7,11,13,17],'19':[3,5,7,11,13,17,19],'23':[3,5,7,11,13,17,19,23],'29':[3,5,7,11,13,17,19,23,29],'31':[3,5,7,11,13,17,19,23,29,31]};
-    function updateFiltersFromDropdown(){const l=pLS.value;if(l==='custom')return;const pTS=new Set(pL[l]);activePrimes.clear();pCB.forEach(cb=>{const p=parseInt(cb.dataset.prime);cb.checked=pTS.has(p);if(cb.checked)activePrimes.add(p);});drawLattice();}
-    pLS.addEventListener('change',updateFiltersFromDropdown);
-    pCB.forEach(cb=>{cb.addEventListener('change',(e)=>{const p=parseInt(e.target.dataset.prime);if(e.target.checked){activePrimes.add(p);}else{activePrimes.delete(p);}pLS.value='custom';drawLattice();});});
-
-    document.getElementById('parent-limit-select').addEventListener('change', (e) => {
-        const newMode = e.target.value;
-        const activeNodesToPreserve = nodes.filter(n => n.octaveStates.some(osc => osc !== null));
-        const newData = generateLatticeNodes(newMode, activeNodesToPreserve);
-        nodes = newData.nodes;
-        existingRatios = newData.existingRatios;
-        drawLattice();
-    });
-
-    document.getElementById('show-harmonics').addEventListener('change', (e) => {
-        showHarmonics = e.target.checked;
-        drawLattice();
-    });
-    document.getElementById('show-subharmonics').addEventListener('change', (e) => {
-        showSubharmonics = e.target.checked;
-        drawLattice();
-    });
-
-    document.getElementById('interval-select').addEventListener('change', (e) => {
-        const ratioString = e.target.value;
-        const num1Input = document.getElementById('interval-num1');
-        const num2Input = document.getElementById('interval-num2');
-        if (ratioString) {
-            const [numStr, denStr] = ratioString.split('/');
-            num1Input.value = numStr;
-            num2Input.value = denStr;
-        } else {
-            num1Input.value = '';
-            num2Input.value = '';
-        }
-    });
-
-    document.getElementById('interval-num1').addEventListener('input', () => { document.getElementById('interval-select').value = ''; });
-    document.getElementById('interval-num2').addEventListener('input', () => { document.getElementById('interval-select').value = ''; });
-
-    document.getElementById('locate-interval-btn').addEventListener('click', () => {
-        const num1 = parseInt(document.getElementById('interval-num1').value);
-        const num2 = parseInt(document.getElementById('interval-num2').value);
-
-        if (isNaN(num1) || isNaN(num2) || num1 <= 0 || num2 <= 0) {
-            alert('Please enter valid positive integers for the ratio.');
-            highlightedIntervals = [];
-            drawLattice();
+    function handleCanvasMouseMove(event) {
+        if (isDragging) {
+            handlePanMove(event);
             return;
         }
 
-        const targetInterval = normalizeIntervalRatio(num1, num2);
+        const hit = findNodeAt(event.clientX, event.clientY);
+        
+        let newHoveredNode = null;
+        let newHoveredOctave = { node: null, octaveIndex: -1 };
+        let redraw = false;
+
+        if (hit) {
+            if (hit.type === 'node') {
+                newHoveredNode = hit.node;
+                canvas.style.cursor = 'pointer';
+            } else if (hit.type === 'octave') {
+                newHoveredOctave = { node: hit.node, octaveIndex: hit.index };
+                canvas.style.cursor = 'crosshair';
+            }
+        } else {
+            canvas.style.cursor = 'default';
+        }
+
+        if (hoveredNode !== newHoveredNode || 
+            hoveredOctave.node !== newHoveredOctave.node || 
+            hoveredOctave.octaveIndex !== newHoveredOctave.octaveIndex) {
+            
+            hoveredNode = newHoveredNode;
+            hoveredOctave = newHoveredOctave;
+            redraw = true;
+        }
+
+        if (redraw) {
+            drawLattice();
+        }
+    }
+
+
+    // --- INITIALIZATION & BINDINGS ---
+    function setupEventListeners() {
+        // --- Pan and Zoom ---
+        canvas.addEventListener('wheel', handleZoom, { passive: false }); 
+        
+        canvas.addEventListener('mousedown', handlePanStart); 
+        window.addEventListener('mouseup', handlePanEnd);     
+        window.addEventListener('mousemove', handlePanMove);  
+        
+        // --- Other Interactions ---
+        canvas.addEventListener('click', handleCanvasClick);
+        canvas.addEventListener('mousemove', handleCanvasMouseMove);
+        window.addEventListener('resize', setupCanvas); 
+
+        // --- UI Control Bindings ---
+        document.getElementById('zoom-slider').addEventListener('input', (e) => setZoom(parseFloat(e.target.value)));
+        document.getElementById('waveform').addEventListener('change', (e) => { waveform = e.target.value; });
+        document.getElementById('volume').addEventListener('input', (e) => { 
+            masterGain.gain.setValueAtTime(parseFloat(e.target.value), audioCtx.currentTime); 
+            document.getElementById('volume-val').textContent = parseFloat(e.target.value).toFixed(2);
+        });
+        document.getElementById('attack').addEventListener('input', (e) => { 
+            attackTime = parseFloat(e.target.value); 
+            document.getElementById('attack-val').textContent = attackTime.toFixed(2);
+        });
+        document.getElementById('decay').addEventListener('input', (e) => { 
+            releaseTime = parseFloat(e.target.value); 
+            document.getElementById('decay-val').textContent = releaseTime.toFixed(2);
+        });
+        document.getElementById('filter-freq').addEventListener('input', (e) => { 
+            lowPassFilter.frequency.setValueAtTime(parseFloat(e.target.value), audioCtx.currentTime); 
+            document.getElementById('filter-freq-val').textContent = e.target.value;
+        });
+        document.getElementById('filter-q').addEventListener('input', (e) => { 
+            lowPassFilter.Q.setValueAtTime(parseFloat(e.target.value), audioCtx.currentTime); 
+            document.getElementById('filter-q-val').textContent = parseFloat(e.target.value).toFixed(1);
+        });
+
+        document.querySelectorAll('input[name="pitch-display"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                displayMode = e.target.value;
+                const iE=document.getElementById('fundamental-input');
+                const lE=document.getElementById('fundamental-label');
+                if(displayMode==='hz'){lE.textContent='Fundamental (Hz):';iE.value=fundamental.toFixed(2);}else{lE.textContent='Fundamental (Pitch + Cents):';iE.value=freqToPitchName(fundamental);}
+                drawLattice();
+            });
+        });
+
+        document.getElementById('prime-limit-select').addEventListener('change', updatePrimeFiltersFromLimit);
+        document.getElementById('parent-limit-select').addEventListener('change', updateLattice);
+        document.getElementById('prime-filters').addEventListener('change', handlePrimeFilterChange);
+        document.getElementById('show-harmonics').addEventListener('change', updateLattice);
+        document.getElementById('show-subharmonics').addEventListener('change', updateLattice);
+
+        document.getElementById('interval-select').addEventListener('change', handlePresetIntervalChange);
+        document.getElementById('locate-interval-btn').addEventListener('click', locateInterval);
+        document.getElementById('clear-interval-btn').addEventListener('click', clearHighlightedIntervals);
+        
+        document.querySelectorAll('.control-group > h2').forEach(header => {
+            header.addEventListener('click', (e) => {
+                e.currentTarget.parentNode.classList.toggle('collapsed');
+            });
+        });
+
+        // Initialize display values for controls
+        document.getElementById('zoom-val').textContent = zoomLevel.toFixed(2);
+        document.getElementById('volume-val').textContent = masterGain.gain.value.toFixed(2);
+        document.getElementById('attack-val').textContent = attackTime.toFixed(2);
+        document.getElementById('decay-val').textContent = releaseTime.toFixed(2);
+        document.getElementById('filter-freq-val').textContent = lowPassFilter.frequency.value;
+        document.getElementById('filter-q-val').textContent = lowPassFilter.Q.value.toFixed(1);
+    }
+    
+    function setupCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const container = document.getElementById('container');
+        // Set canvas width/height attributes (used by ctx)
+        canvas.width = container.clientWidth * dpr;
+        canvas.height = container.clientHeight * dpr;
+        // Set CSS width/height (what the user sees)
+        canvas.style.width = container.clientWidth + 'px';
+        canvas.style.height = container.clientHeight + 'px';
+        ctx.scale(dpr, dpr); // Scale context for high DPI displays
+        drawLattice();
+    }
+
+    function setFundamental() {
+        let newFreq = parseFloat(document.getElementById('fundamental-input').value);
+        if (displayMode !== 'hz') {
+            const pitchFreq = pitchNameToFreq(document.getElementById('fundamental-input').value.trim());
+            if (pitchFreq !== null) newFreq = pitchFreq;
+        }
+
+        if (isNaN(newFreq) || newFreq <= 0) {
+            newFreq = 440;
+            if(displayMode === 'hz') document.getElementById('fundamental-input').value = '440';
+        }
+        
+        fundamental = newFreq;
+        if(displayMode === 'pitch') {
+            document.getElementById('fundamental-input').value = freqToPitchName(fundamental);
+        } else {
+            document.getElementById('fundamental-input').value = fundamental.toFixed(2);
+        }
+
+        deactivateAll();
+        drawLattice();
+    }
+
+    function updateLattice() {
+        showHarmonics = document.getElementById('show-harmonics').checked;
+        showSubharmonics = document.getElementById('show-subharmonics').checked;
+
+        const generationMode = document.getElementById('parent-limit-select').value;
+        
+        // Pass nodes with active audio state to preserve them
+        const nodesToPreserve = nodes ? nodes.filter(n => n.octaveStates.some(o => o !== null)) : [];
+        
+        const result = generateLatticeNodes(generationMode, nodesToPreserve);
+        nodes = result.nodes;
+        existingRatios = result.existingRatios;
+        drawLattice();
+    }
+    
+    const pL={'3':[3],'5':[3,5],'7':[3,5,7],'11':[3,5,7,11],'13':[3,5,7,11,13],'17':[3,5,7,11,13,17],'19':[3,5,7,11,13,17,19],'23':[3,5,7,11,13,17,19,23],'29':[3,5,7,11,13,17,19,23,29],'31':[3,5,7,11,13,17,19,23,29,31]};
+
+    function updatePrimeFiltersFromLimit(e) {
+        const limit = e.target.value;
+        const checkboxes = document.querySelectorAll('#prime-filters input[type="checkbox"]');
+        let newActivePrimes = new Set();
+        
+        if (limit !== 'custom') {
+            const primesToSet = pL[limit] || [];
+            checkboxes.forEach(cb => {
+                const prime = parseInt(cb.dataset.prime);
+                const shouldBeChecked = primesToSet.includes(prime);
+                cb.checked = shouldBeChecked;
+                if (shouldBeChecked) newActivePrimes.add(prime);
+            });
+            activePrimes.clear();
+            newActivePrimes.forEach(p => activePrimes.add(p));
+        } else {
+            // Re-read current custom state
+            activePrimes.clear();
+            checkboxes.forEach(cb => {
+                if (cb.checked) {
+                    const prime = parseInt(cb.dataset.prime);
+                    if (prime > 2) activePrimes.add(prime);
+                }
+            });
+        }
+        updateLattice();
+    }
+
+    function handlePrimeFilterChange(e) {
+        const prime = parseInt(e.target.dataset.prime);
+        const isChecked = e.target.checked;
+        
+        if (prime > 2) {
+            if (isChecked) {
+                activePrimes.add(prime);
+            } else {
+                activePrimes.delete(prime);
+            }
+        }
+        document.getElementById('prime-limit-select').value = 'custom';
+        updateLattice();
+    }
+
+    function handlePresetIntervalChange(e) {
+        const value = e.target.value;
+        if (value) {
+            const [num, den] = value.split('/').map(n => parseInt(n));
+            document.getElementById('interval-num1').value = num;
+            document.getElementById('interval-num2').value = den;
+        } else {
+            document.getElementById('interval-num1').value = '';
+            document.getElementById('interval-num2').value = '';
+        }
+    }
+    
+    document.getElementById('interval-num1').addEventListener('input', () => { document.getElementById('interval-select').value = ''; });
+    document.getElementById('interval-num2').addEventListener('input', () => { document.getElementById('interval-select').value = ''; });
+
+
+    function locateInterval() {
+        let num = parseInt(document.getElementById('interval-num1').value);
+        let den = parseInt(document.getElementById('interval-num2').value);
+
+        if (isNaN(num) || isNaN(den) || num <= 0 || den <= 0) {
+            alert("Please enter valid, positive numbers for the ratio.");
+            return;
+        }
+
+        const targetInterval = normalizeIntervalRatio(num, den);
         highlightedIntervals = [];
+
         const visibleNodes = nodes.filter(shouldNodeBeVisible);
 
         for (let i = 0; i < visibleNodes.length; i++) {
@@ -834,31 +1160,31 @@
             }
         }
         drawLattice();
-    });
+        if (highlightedIntervals.length === 0) {
+            alert(`No visible pairs found for the interval ${num}:${den}.`);
+        }
+    }
 
-    document.getElementById('clear-interval-btn').addEventListener('click', () => {
+    function clearHighlightedIntervals() {
         highlightedIntervals = [];
         document.getElementById('interval-select').value = '';
         document.getElementById('interval-num1').value = '';
         document.getElementById('interval-num2').value = '';
         drawLattice();
-    });
-    
-    /* --- UI Interactivity --- */
-    document.querySelectorAll('.control-group > h2').forEach(header => {
-        header.addEventListener('click', () => {
-            header.parentElement.classList.toggle('collapsed');
-        });
-    });
+    }
 
-    // Initial setup calls
-    window.addEventListener('resize', resizeCanvas); 
-    const initialData = generateLatticeNodes(document.getElementById('parent-limit-select').value);
-    nodes = initialData.nodes;
-    existingRatios = initialData.existingRatios;
-    populateIntervalSelector();
-    resizeCanvas();
+    // --- EXECUTION ---
+    function initialize() {
+        const result = generateLatticeNodes(document.getElementById('parent-limit-select').value);
+        nodes = result.nodes;
+        existingRatios = result.existingRatios;
+        setupEventListeners();
+        populateIntervalSelector();
+        setupCanvas(); 
+        setFundamental(); 
+    }
 
+    initialize();
   </script>
 </body>
 </html>
