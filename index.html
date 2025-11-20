@@ -374,7 +374,7 @@
     const PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     const C4_FREQ = 440 * Math.pow(2, -9/12); 
     
-    // UPDATED helper: Robustly parses "Note + Cents" including optional spaces and 'c' suffix
+    // Robustly parses "Note + Cents" including optional spaces and 'c' suffix
     function parsePitchClassToCents(pS) {
         // Matches: Note(with opt #), optional spaces, optional (+/- digits), optional spaces, optional 'c'
         const m = pS.match(/([A-G]#?)\s*([+\-]?\d+)?\s*c?/i);
@@ -745,17 +745,25 @@
         }
     }
     
+    // MODIFIED: toggleOctave now handles disabling all octaves on main node click
     function toggleOctave(nD, oI, isMainNodeClick = false) {
         if (!nD) return;
+        
+        // 1. If clicking the main node (circle), and ANY octave is active, turn EVERYTHING off.
+        if (isMainNodeClick) {
+            const isAnyOctaveActive = nD.octaveStates.some(s => s !== null);
+            if (isAnyOctaveActive) {
+                deactivateAllOctaves(nD);
+                return;
+            }
+        }
+
+        // 2. Normal toggle logic for specific selectors (or turning ON via main node)
         const octaveIndex = oI;
 
         if (nD.octaveStates[octaveIndex] !== null) {
-            if (isMainNodeClick) {
-                deactivateAllOctaves(nD);
-            } else {
-                deactivateOctave(nD, octaveIndex);
-                drawLattice(); 
-            }
+            deactivateOctave(nD, octaveIndex);
+            drawLattice();
             return;
         }
         
@@ -840,12 +848,12 @@
     for(const n of nTC){if(Math.pow(worldX-n.x,2)+Math.pow(worldY-n.y,2)<NODE_RADIUS*NODE_RADIUS){toggleOctave(n,2,true);return;}
     for(let j=0;j<OCTAVE_MULTIPLIERS.length;j++){const sX=n.x+OCTAVE_SELECTOR_X_OFFSET;const sY=n.y-(2*OCTAVE_SELECTOR_Y_STEP)+(j*OCTAVE_SELECTOR_Y_STEP);if(Math.pow(worldX-sX,2)+Math.pow(worldY-sY,2)<(OCTAVE_SELECTOR_RADIUS+4)*(OCTAVE_SELECTOR_RADIUS+4)){toggleOctave(n,j,false);return;}}}});
     
-    // UPDATED: Wheel/Scroll event to handle Trackpad Pinch-to-Zoom
+    // Wheel/Scroll event to handle Trackpad Pinch-to-Zoom
     canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
         // If ctrlKey is pressed, it's a trackpad pinch (on most browsers)
         if (e.ctrlKey) {
-            const zoomSensitivity = 0.005;
+            const zoomSensitivity = 0.005; 
             const delta = -e.deltaY * zoomSensitivity;
             let newZoom = zoomLevel + delta;
 
@@ -999,7 +1007,10 @@
 
         visibleNodes.forEach(node => {
             const baseFreq = fundamental * (node.ratio[0] / node.ratio[1]);
-            const nodeCents = freqToAbsoluteCents(baseFreq);
+            // MODIFIED: Round the cents to the nearest integer to match the display values
+            let rawCents = freqToAbsoluteCents(baseFreq);
+            let nodeCents = Math.round(rawCents);
+            if (nodeCents === 1200) nodeCents = 0; // Wrap 1200 back to 0
 
             let isMatch = false;
             if (minCents <= maxCents) {
